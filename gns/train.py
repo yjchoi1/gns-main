@@ -5,6 +5,7 @@ import pickle
 import glob
 import re
 import sys
+from typing import List
 
 import numpy as np
 import torch
@@ -849,6 +850,135 @@ def validation(simulator, example, n_features, cfg, rank, device_id):
     loss = acceleration_loss(pred_acc, target_acc, non_kinematic_mask)
 
     return loss
+
+
+def predict_multiple_files(device: str, cfg: DictConfig, npz_files: List[str], save_format: str = "pkl"):
+    """Predict rollouts for multiple .npz files.
+
+    Args:
+      device: 'cpu' or 'cuda'.
+      cfg: configuration dictionary.
+      npz_files: List of paths to .npz files to process.
+    """
+    # Read metadata from the first file (assuming all files have same metadata)
+    metadata = reading_utils.read_metadata(cfg.data.path, "rollout", cfg.data.meta_data)
+    simulator = _get_simulator(
+        metadata,
+        cfg.data.num_particle_types,
+        cfg.data.noise_std,
+        cfg.data.noise_std,
+        device,
+    )
+
+    # Load simulator
+    if os.path.exists(cfg.model.path + cfg.model.file):
+        simulator.load(cfg.model.path + cfg.model.file)
+    else:
+        raise Exception(f"Model does not exist at {cfg.model.path + cfg.model.file}")
+
+    simulator.to(device)
+    simulator.eval()
+
+    # Output path
+    if not os.path.exists(cfg.output.path):
+        os.makedirs(cfg.output.path)
+
+    # Process each .npz file
+    for npz_file in npz_files:
+        # Get base filename without extension
+        base_filename = os.path.splitext(os.path.basename(npz_file))[0]
+        
+        # Get dataset
+        ds = pdl.get_data_loader(file_path=npz_file, mode="trajectory")
+        # See if our dataset has material property as feature
+        test_dataset = pdl.ParticleDataset(npz_file)
+        n_features = test_dataset.get_num_features()
+        if n_features == 3:  # `ds` has (positions, particle_type, material_property)
+            material_property_as_feature = True
+        elif n_features == 2:  # `ds` only has (positions, particle_type)
+            material_property_as_feature = False
+        else:
+            raise NotImplementedError
+
+        eval_loss = []
+        with torch.no_grad():
+            for example_i, features in enumerate(ds):
+                print(f"processing example number {example_i} from {base_filename}")
+                positions = features[0].to(device)
+                if metadata["sequence_length"] is not None:
+                    # If `sequence_length` is predefined in metadata,
+                    nsteps = metadata["sequence_length"] - cfg.data.input_sequence_length
+                else:
+                    # If no predefined `sequence_length`, then get the sequence length
+                    sequence_length = positions.shape[1]
+                    nsteps = sequence_length - cfg.data.input_sequence_length
+                particle_type = features[1].to(device)
+                if material_property_as_feature:
+                    material_property = features[2].to(device)
+                    n_particles_per_example = torch.tensor(
+                        [int(features[3])], dtype=torch.int32
+                    ).to(device)
+                else:
+                    material_property = None
+                    n_particles_per_example = torch.tensor(
+                        [int(features[2])], dtype=torch.int32
+                    ).to(device)
+
+                # Predict example rollout
+                example_rollout, loss = rollout(
+                    simulator,
+                    cfg,
+                    positions,
+                    particle_type,
+                    material_property,
+                    n_particles_per_example,
+                    nsteps,
+                    device,
+                )
+
+                example_rollout["metadata"] = metadata
+                print("Predicting example {} loss: {}".format(example_i, loss.mean()))
+                eval_loss.append(torch.flatten(loss))
+
+                # Save rollout in testing
+                if cfg.mode == "rollout":
+                    example_rollout["metadata"] = metadata
+                    example_rollout["loss"] = loss.mean()
+                    
+                    if save_format == "pkl":
+                        filename_render = f"{base_filename}_ex{example_i}.pkl"
+                        filename = os.path.join(cfg.output.path, filename_render)
+                        with open(filename, "wb") as f:
+                            pickle.dump(example_rollout, f)
+                    elif save_format == "npz":
+                        rollout = torch.cat(
+                            (example_rollout["initial_positions"], 
+                             torch.stack(example_rollout["predicted_rollout"]))
+                        )
+                        material_property = example_rollout["material_property"]
+                        particle_types = example_rollout["particle_types"]
+                        
+                        # Make npz
+                        save_path = os.path.join(cfg.output.path, f"{base_filename}_ex{example_i}.npz")
+                        trajectories = {}
+                        trajectories[save_path] = (
+                            rollout.astype("float32"),  # position sequence (timesteps, particles, dims)
+                            particle_types.astype("int32"),  # particle type (particles, )
+                            material_property.astype("float32"))  # particle type (particles, n_particle_features)
+
+                        # Create structured array to hold the data
+                        structured_data = np.empty(len(trajectories), dtype=object)
+                        for i, value in enumerate(trajectories.values()):
+                            structured_data[i] = value
+
+                        np.savez_compressed(save_path, gns_data=structured_data)
+                            
+                if cfg.rendering.mode:
+                    rendering(cfg.output.path, f"{base_filename}_ex{example_i}", cfg)
+
+        print(
+            f"Mean loss on rollout prediction for {base_filename}: {torch.mean(torch.cat(eval_loss))}"
+        )
 
 
 @hydra.main(version_base=None, config_path="..", config_name="config")
