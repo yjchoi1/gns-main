@@ -28,6 +28,48 @@ from gns.args import Config
 Stats = collections.namedtuple("Stats", ["mean", "std"])
 
 
+def get_data_file_path(data_path: str, split: str) -> str:
+    """
+    Get the appropriate data file path, checking for both .h5 and .npz formats.
+    
+    Args:
+        data_path: Base path to the data directory
+        split: Data split name ('train', 'valid', 'test')
+    
+    Returns:
+        Full path to the data file
+        
+    Raises:
+        FileNotFoundError: If neither .h5 nor .npz file exists
+    """
+    h5_path = f"{data_path}{split}.h5"
+    npz_path = f"{data_path}{split}.npz"
+    
+    if os.path.exists(h5_path):
+        return h5_path
+    elif os.path.exists(npz_path):
+        return npz_path
+    else:
+        raise FileNotFoundError(f"Neither {h5_path} nor {npz_path} exists")
+
+
+def data_file_exists(data_path: str, split: str) -> bool:
+    """
+    Check if a data file exists in either .h5 or .npz format.
+    
+    Args:
+        data_path: Base path to the data directory
+        split: Data split name ('train', 'valid', 'test')
+    
+    Returns:
+        True if file exists, False otherwise
+    """
+    h5_path = f"{data_path}{split}.h5"
+    npz_path = f"{data_path}{split}.npz"
+    
+    return os.path.exists(h5_path) or os.path.exists(npz_path)
+
+
 def rollout(
     simulator: learned_simulator.LearnedSimulator,
     cfg: DictConfig,
@@ -141,14 +183,15 @@ def predict(device: str, cfg: DictConfig):
     # Use `valid`` set for eval mode if not use `test`
     split = (
         "test"
-        if (cfg.mode == "rollout" or (not os.path.isfile("{cfg.data.path}valid.npz")))
+        if (cfg.mode == "rollout" or (not data_file_exists(cfg.data.path, "valid")))
         else "valid"
     )
 
     # Get dataset
-    ds = pdl.get_data_loader(file_path=f"{cfg.data.path}{split}.npz", mode="trajectory")
+    test_file_path = get_data_file_path(cfg.data.path, split)
+    ds = pdl.get_data_loader(file_path=test_file_path, mode="trajectory")
     # See if our dataset has material property as feature
-    test_dataset = pdl.ParticleDataset(f"{cfg.data.path}{split}.npz")
+    test_dataset = pdl.ParticleDataset(test_file_path)
     n_features = test_dataset.get_num_features()
     if n_features == 3:  # `ds` has (positions, particle_type, material_property)
         material_property_as_feature = True
@@ -386,30 +429,32 @@ def initialize_training(cfg, rank, world_size, device, use_dist):
 
 def load_datasets(cfg, use_dist):
     # Train data loader
+    train_file_path = get_data_file_path(cfg.data.path, "train")
     train_dl = pdl.get_data_loader(
-        file_path=f"{cfg.data.path}train.npz",
+        file_path=train_file_path,
         mode="sample",
         input_sequence_length=cfg.data.input_sequence_length,
         batch_size=cfg.data.batch_size,
         use_dist=use_dist,
     )
-    train_dataset = pdl.ParticleDataset(f"{cfg.data.path}train.npz")
+    train_dataset = pdl.ParticleDataset(train_file_path)
     n_features = train_dataset.get_num_features()
 
     # Validation data loader
     valid_dl = None
     if cfg.training.validation_interval is not None:
+        valid_file_path = get_data_file_path(cfg.data.path, "valid")
         valid_dl = pdl.get_data_loader(
-            file_path=f"{cfg.data.path}valid.npz",
+            file_path=valid_file_path,
             mode="sample",
             input_sequence_length=cfg.data.input_sequence_length,
             batch_size=cfg.data.batch_size,
             use_dist=use_dist,
         )
-        valid_dataset = pdl.ParticleDataset(f"{cfg.data.path}valid.npz")
+        valid_dataset = pdl.ParticleDataset(valid_file_path)
         if valid_dataset.get_num_features() != n_features:
             raise ValueError(
-                f"`n_features` of `valid.npz` and `train.npz` should be the same"
+                f"`n_features` of validation and training datasets should be the same"
             )
 
     return train_dl, valid_dl, n_features
@@ -852,13 +897,14 @@ def validation(simulator, example, n_features, cfg, rank, device_id):
     return loss
 
 
-def predict_multiple_files(device: str, cfg: DictConfig, npz_files: List[str], save_format: str = "pkl"):
-    """Predict rollouts for multiple .npz files.
+def predict_multiple_files(device: str, cfg: DictConfig, data_files: List[str], save_format: str = "pkl"):
+    """Predict rollouts for multiple data files (.npz or .h5 formats).
 
     Args:
       device: 'cpu' or 'cuda'.
       cfg: configuration dictionary.
-      npz_files: List of paths to .npz files to process.
+      data_files: List of paths to data files (.npz or .h5) to process.
+      save_format: Format to save the predictions ('pkl' or 'npz').
     """
     # Read metadata from the first file (assuming all files have same metadata)
     metadata = reading_utils.read_metadata(cfg.data.path, "rollout", cfg.data.meta_data)
@@ -883,15 +929,15 @@ def predict_multiple_files(device: str, cfg: DictConfig, npz_files: List[str], s
     if not os.path.exists(cfg.output.path):
         os.makedirs(cfg.output.path)
 
-    # Process each .npz file
-    for npz_file in npz_files:
+    # Process each data file
+    for data_file in data_files:
         # Get base filename without extension
-        base_filename = os.path.splitext(os.path.basename(npz_file))[0]
+        base_filename = os.path.splitext(os.path.basename(data_file))[0]
         
         # Get dataset
-        ds = pdl.get_data_loader(file_path=npz_file, mode="trajectory")
+        ds = pdl.get_data_loader(file_path=data_file, mode="trajectory")
         # See if our dataset has material property as feature
-        test_dataset = pdl.ParticleDataset(npz_file)
+        test_dataset = pdl.ParticleDataset(data_file)
         n_features = test_dataset.get_num_features()
         if n_features == 3:  # `ds` has (positions, particle_type, material_property)
             material_property_as_feature = True
