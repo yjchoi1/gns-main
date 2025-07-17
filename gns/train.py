@@ -1006,7 +1006,7 @@ def predict_multiple_files(device: str, cfg: DictConfig, data_files: List[str], 
                         with open(filename, "wb") as f:
                             pickle.dump(example_rollout, f)
                     elif save_format == "npz":
-                        rollout = torch.cat(
+                        rollout_positions = torch.cat(
                             (example_rollout["initial_positions"], 
                              torch.stack(example_rollout["predicted_rollout"]))
                         )
@@ -1017,7 +1017,7 @@ def predict_multiple_files(device: str, cfg: DictConfig, data_files: List[str], 
                         save_path = os.path.join(cfg.output.path, f"{base_filename}_ex{example_i}.npz")
                         trajectories = {}
                         trajectories[save_path] = (
-                            rollout.astype("float32"),  # position sequence (timesteps, particles, dims)
+                            rollout_positions.astype("float32"),  # position sequence (timesteps, particles, dims)
                             particle_types.astype("int32"),  # particle type (particles, )
                             material_property.astype("float32"))  # particle type (particles, n_particle_features)
 
