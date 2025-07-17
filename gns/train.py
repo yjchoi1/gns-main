@@ -929,6 +929,11 @@ def predict_multiple_files(device: str, cfg: DictConfig, data_files: List[str], 
     if not os.path.exists(cfg.output.path):
         os.makedirs(cfg.output.path)
 
+    # Initialize statistics collection
+    all_losses = []  # Collect all individual example losses
+    file_statistics = {}  # Per-file statistics
+    total_examples = 0
+
     # Process each data file
     for data_file in data_files:
         # Get base filename without extension
@@ -983,13 +988,17 @@ def predict_multiple_files(device: str, cfg: DictConfig, data_files: List[str], 
                 )
 
                 example_rollout["metadata"] = metadata
-                print("Predicting example {} loss: {}".format(example_i, loss.mean()))
+                example_loss = loss.mean()
+                print("Predicting example {} loss: {}".format(example_i, example_loss))
                 eval_loss.append(torch.flatten(loss))
+                # Add to overall statistics collection
+                all_losses.extend(torch.flatten(loss).cpu().numpy())
+                total_examples += 1
 
                 # Save rollout in testing
                 if cfg.mode == "rollout":
                     example_rollout["metadata"] = metadata
-                    example_rollout["loss"] = loss.mean()
+                    example_rollout["loss"] = example_loss
                     
                     if save_format == "pkl":
                         filename_render = f"{base_filename}_ex{example_i}.pkl"
@@ -1022,9 +1031,78 @@ def predict_multiple_files(device: str, cfg: DictConfig, data_files: List[str], 
                 if cfg.rendering.mode:
                     rendering(cfg.output.path, f"{base_filename}_ex{example_i}", cfg)
 
-        print(
-            f"Mean loss on rollout prediction for {base_filename}: {torch.mean(torch.cat(eval_loss))}"
-        )
+        # Compute per-file statistics
+        file_losses = torch.cat(eval_loss).cpu().numpy()
+        file_mean_loss = torch.mean(torch.cat(eval_loss))
+        file_std_loss = torch.std(torch.cat(eval_loss))
+        
+        file_statistics[base_filename] = {
+            "mean_loss": float(file_mean_loss),
+            "std_loss": float(file_std_loss),
+            "num_examples": len(eval_loss),
+            "file_path": data_file
+        }
+        
+        print(f"Mean loss on rollout prediction for {base_filename}: {file_mean_loss}")
+        print(f"Std loss on rollout prediction for {base_filename}: {file_std_loss}")
+
+    # Compute overall statistics across all files
+    all_losses = np.array(all_losses)
+    overall_mean_loss = np.mean(all_losses)
+    overall_std_loss = np.std(all_losses)
+    overall_min_loss = np.min(all_losses)
+    overall_max_loss = np.max(all_losses)
+    
+    # Create comprehensive statistics dictionary
+    rollout_statistics = {
+        "overall_statistics": {
+            "mean_loss": float(overall_mean_loss),
+            "std_loss": float(overall_std_loss),
+            "min_loss": float(overall_min_loss),
+            "max_loss": float(overall_max_loss),
+            "total_examples": total_examples,
+            "total_files": len(data_files)
+        },
+        "per_file_statistics": file_statistics,
+        "configuration": {
+            "model_path": cfg.model.path + cfg.model.file,
+            "data_files": data_files,
+            "save_format": save_format,
+            "device": str(device)
+        }
+    }
+    
+    # Save statistics to JSON file
+    stats_filename = os.path.join(cfg.output.path, "rollout_statistics.json")
+    with open(stats_filename, "w") as f:
+        json.dump(rollout_statistics, f, indent=4)
+    
+    # Also save detailed losses for further analysis if needed
+    detailed_stats_filename = os.path.join(cfg.output.path, "detailed_losses.json")
+    file_boundaries = np.cumsum([file_statistics[os.path.splitext(os.path.basename(f))[0]]["num_examples"] for f in data_files])
+    
+    detailed_losses_data = {
+        "all_losses": all_losses.tolist(),  # Convert numpy array to list for JSON serialization
+        "file_boundaries": file_boundaries.tolist(),
+        "file_names": [os.path.splitext(os.path.basename(f))[0] for f in data_files]
+    }
+    
+    with open(detailed_stats_filename, "w") as f:
+        json.dump(detailed_losses_data, f, indent=4)
+    
+    # Print overall summary
+    print("\n" + "="*60)
+    print("OVERALL ROLLOUT STATISTICS SUMMARY")
+    print("="*60)
+    print(f"Total files processed: {len(data_files)}")
+    print(f"Total examples processed: {total_examples}")
+    print(f"Overall mean loss: {overall_mean_loss:.6f}")
+    print(f"Overall std loss: {overall_std_loss:.6f}")
+    print(f"Overall min loss: {overall_min_loss:.6f}")
+    print(f"Overall max loss: {overall_max_loss:.6f}")
+    print(f"Statistics saved to: {stats_filename}")
+    print(f"Detailed losses saved to: {detailed_stats_filename}")
+    print("="*60)
 
 
 @hydra.main(version_base=None, config_path="..", config_name="config")
